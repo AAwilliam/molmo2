@@ -13,7 +13,7 @@ from torch.nn import functional as F
 
 from olmo.config import BaseConfig, D, StrEnum
 from olmo.nn.cp_load_balancer import CPLoadBalancerType, CPLoadBalancer
-from olmo.nn.image_vit import VitConfig, VisionTransformer
+from olmo.nn.image_vit import VitConfig, VisionTransformer, VisionBackboneType
 from olmo.nn.llm import Activation
 from olmo.preprocessing.image_preprocessor import ImagePreprocessor
 from olmo.torch_util import freeze_module
@@ -193,28 +193,38 @@ class MolmoVisionBackbone(nn.Module):
         self.image_pooling_2d, self.image_projector = self.build_connector(llm_config, device)
         self.image_feature_dropout = nn.Dropout(config.image_feature_dropout)
 
-        self.vit_layers = []
-        for layer in config.vit_layers:
-            if layer >= 0:
-                self.vit_layers.append(layer)
-            else:
-                self.vit_layers.append(config.vit.image_num_layers + layer)
-        last_layer_needed = (max(self.vit_layers)+1)
-
         vit_cfg = self.config.vit
-        if last_layer_needed < config.vit.image_num_layers:
-            if self.config.skip_unused_layers:
-                vit_cfg = replace(vit_cfg, image_num_layers=last_layer_needed)
-                self.image_vit: VisionTransformer = vit_cfg.build(device)
-            else:
-                # We might need to keep the layers for checkpoint compatibility, but we
-                # freeze them since unfrozen layers with no gradient confuses torch's distributed
-                # optimizer checkpointer
-                self.image_vit: VisionTransformer = vit_cfg.build(device)
-                for block in self.image_vit.transformer.resblocks[last_layer_needed-1:]:
-                    freeze_module(block)
+        if vit_cfg.image_model_type == VisionBackboneType.radio:
+            if tuple(config.vit_layers) not in {(0,), (-1,)}:
+                raise ValueError(
+                    "C-RADIO currently exposes only final spatial features; "
+                    "set vit_layers to [0] or [-1]"
+                )
+            self.image_vit = vit_cfg.build(device)
+            # RadioVisionTransformer.forward returns [final_spatial_features].
+            self.vit_layers = [0]
         else:
-            self.image_vit: VisionTransformer = vit_cfg.build(device)
+            self.vit_layers = []
+            for layer in config.vit_layers:
+                if layer >= 0:
+                    self.vit_layers.append(layer)
+                else:
+                    self.vit_layers.append(config.vit.image_num_layers + layer)
+            last_layer_needed = (max(self.vit_layers)+1)
+
+            if last_layer_needed < config.vit.image_num_layers:
+                if self.config.skip_unused_layers:
+                    vit_cfg = replace(vit_cfg, image_num_layers=last_layer_needed)
+                    self.image_vit: VisionTransformer = vit_cfg.build(device)
+                else:
+                    # We might need to keep the layers for checkpoint compatibility, but we
+                    # freeze them since unfrozen layers with no gradient confuses torch's distributed
+                    # optimizer checkpointer
+                    self.image_vit: VisionTransformer = vit_cfg.build(device)
+                    for block in self.image_vit.transformer.resblocks[last_layer_needed-1:]:
+                        freeze_module(block)
+            else:
+                self.image_vit: VisionTransformer = vit_cfg.build(device)
 
         self.num_prefix_tokens = self.image_vit.num_prefix_tokens
         assert self.num_prefix_tokens in {0, 1}, "Only 0 or 1 prefix tokens are supported"

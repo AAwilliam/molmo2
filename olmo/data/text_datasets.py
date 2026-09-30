@@ -1,4 +1,5 @@
 import datasets
+from pathlib import Path
 
 from olmo.data.dataset import Dataset
 
@@ -37,7 +38,7 @@ class Tulu4Filtered(Dataset):
 
     def __init__(self, split: str, use_code=False, use_puzzles=False, use_reasoning=False, use_non_english=False, max_first_msg_len=4096):
         self.data = datasets.load_dataset(
-            "allenai/molmo2-tulu4-classified",
+            str(Path(__file__).resolve().parents[2] / "dataset" / "stage1" / "molmo2-tulu4-classified"),
             split=split,
             keep_in_memory=False
         )

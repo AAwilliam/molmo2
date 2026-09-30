@@ -1,10 +1,15 @@
+import hashlib
+import importlib.util
+import json
 import logging
 import math
 import os
+import sys
 import time
+import types
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.backends.cuda
@@ -28,6 +33,7 @@ class VisionBackboneType(StrEnum):
     openai = "openai"
     siglip = "siglip"
     dino = "dino"
+    radio = "radio"
 
 
 class SdpaBackendType(StrEnum):
@@ -102,6 +108,8 @@ class VitConfig(BaseConfig):
             return SiglipVisionTransformer(self)
         elif self.image_model_type == VisionBackboneType.dino:
             return DinoVisionTransformer(self)
+        elif self.image_model_type == VisionBackboneType.radio:
+            return RadioVisionTransformer(self, device)
         else:
             raise NotImplementedError(f"Unknown image model type: {self.image_model_type}")
 
@@ -755,3 +763,219 @@ class DinoVisionTransformer(nn.Module):
 
         hidden_states = self.transformer(x)
         return hidden_states
+
+
+def _load_hf_safetensors(snapshot_dir: str) -> Dict[str, torch.Tensor]:
+    """Load model weights from a local Hugging Face snapshot directory."""
+    from safetensors.torch import load_file
+
+    state_dict: Dict[str, torch.Tensor] = {}
+    index_path = os.path.join(snapshot_dir, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        for shard in sorted(set(index["weight_map"].values())):
+            state_dict.update(load_file(os.path.join(snapshot_dir, shard)))
+    elif os.path.isfile(os.path.join(snapshot_dir, "model.safetensors")):
+        state_dict.update(load_file(os.path.join(snapshot_dir, "model.safetensors")))
+    else:
+        for name in sorted(os.listdir(snapshot_dir)):
+            if name.endswith(".bin"):
+                state_dict.update(torch.load(os.path.join(snapshot_dir, name), map_location="cpu"))
+    if not state_dict:
+        raise FileNotFoundError(f"No safetensors or .bin weights found in {snapshot_dir}")
+    return state_dict
+
+
+def _load_local_radio_hf_classes(snapshot_dir: str):
+    """Import the official local C-RADIO HF implementation as a package.
+
+    Transformers' dynamic-module loader does not reliably copy transitive
+    relative imports for this repository when loading from a local directory
+    (for example ``utils.py`` and ``dual_hybrid_vit.py``). Loading the snapshot
+    as a package keeps all official relative imports local and makes training
+    independent of both the network and the HF module cache.
+    """
+    snapshot_dir = os.path.abspath(snapshot_dir)
+    model_file = os.path.join(snapshot_dir, "hf_model.py")
+    if not os.path.isfile(model_file):
+        raise FileNotFoundError(f"Missing official C-RADIO module: {model_file}")
+
+    digest = hashlib.sha1(snapshot_dir.encode("utf-8")).hexdigest()[:12]
+    package_name = f"_molmo_cradio_{digest}"
+    module_name = f"{package_name}.hf_model"
+    if module_name in sys.modules:
+        module = sys.modules[module_name]
+        return module.RADIOConfig, module.RADIOModel
+
+    if package_name not in sys.modules:
+        package = types.ModuleType(package_name)
+        package.__file__ = os.path.join(snapshot_dir, "__init__.py")
+        package.__package__ = package_name
+        package.__path__ = [snapshot_dir]
+        sys.modules[package_name] = package
+
+    spec = importlib.util.spec_from_file_location(module_name, model_file)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not create an import spec for {model_file}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module.RADIOConfig, module.RADIOModel
+
+
+class RadioVisionTransformer(nn.Module):
+    """NVIDIA C-RADIO (local Hugging Face snapshot) as a Molmo vision tower.
+
+    The official model is created structure-only via ``AutoModel.from_config``
+    so the trainer can build it on the ``meta`` device; the weights are loaded
+    from the local snapshot in :meth:`reset_with_pretrained_weights`. Input
+    patches arrive in Molmo layout ``[B, N, patch * patch * 3]`` (row-major
+    patch grid, channel-last pixels in ``[0, 1]``) and are restored to a BCHW
+    image before being handed to C-RADIO, which expects un-normalized input.
+    """
+
+    def __init__(self, config: VitConfig, device=None):
+        super().__init__()
+        self.config = config
+        self.num_prefix_tokens: int = 0
+        if not config.init_path:
+            raise ValueError(
+                "RadioVisionTransformer requires `vit.init_path` to point at a local "
+                "C-RADIO Hugging Face snapshot (see assets/cradio-vit-replacement.md)"
+            )
+        # Importing transformers lazily initializes torchao constants. Do that
+        # on CPU even when Molmo is currently inside ``torch.device("meta")``;
+        # torchao materializes a few constants with ``.tolist()``, which is not
+        # valid for meta tensors. The actual RADIO module is constructed after
+        # this block and therefore still follows the caller's requested device.
+        with torch.device("cpu"):
+            RadioConfig, RadioModel = _load_local_radio_hf_classes(config.init_path)
+            radio_config = RadioConfig.from_pretrained(config.init_path)
+        self.radio = RadioModel(radio_config)
+        if device is not None:
+            self.radio = self.radio.to(device)
+
+    def _unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        """[B, N, p * p * 3] Molmo patches -> [B, 3, H, W] image, values unchanged."""
+        B, N, D = x.shape
+        p = self.config.image_patch_size
+        height, width = self.config.image_default_input_size
+        if height != width or height % p != 0:
+            raise ValueError(f"C-RADIO requires a square crop divisible by patch size, got {(height, width)}, p={p}")
+        side = height // p
+        expected_n, expected_d = side * side, p * p * 3
+        if (N, D) != (expected_n, expected_d):
+            raise ValueError(
+                f"C-RADIO expected Molmo crop patches [B, {expected_n}, {expected_d}] "
+                f"for a {height}x{width} RGB image, got {tuple(x.shape)}"
+            )
+        x = x.reshape(B, side, side, p, p, 3)
+        x = x.permute(0, 1, 3, 2, 4, 5).reshape(B, height, width, 3)
+        return x.permute(0, 3, 1, 2).contiguous()
+
+    @staticmethod
+    def _spatial_features(output) -> torch.Tensor:
+        # The official C-RADIO HF wrapper returns RadioOutput, a NamedTuple
+        # ``(summary, features)`` whose spatial tensor is also available as
+        # ``.features``. Keep the other branches for compatible wrappers.
+        if hasattr(output, "features"):
+            features = output.features
+        elif hasattr(output, "image_features"):
+            features = output.image_features
+        elif (
+            isinstance(output, (tuple, list))
+            and len(output) >= 2
+            and isinstance(output[1], torch.Tensor)
+        ):
+            features = output[1]
+        elif isinstance(output, (tuple, list)) and len(output) > 0 and hasattr(output[0], "image_features"):
+            features = output[0].image_features
+        elif isinstance(output, torch.Tensor):
+            features = output
+        else:
+            raise TypeError(
+                "C-RADIO model output has no spatial features; expected an object "
+                "with `.image_features` of shape [B, N, C]"
+            )
+        if features.dim() == 4:  # [B, C, H, W] -> [B, H * W, C]
+            features = features.flatten(2).transpose(1, 2)
+        if features.dim() != 3:
+            raise ValueError(
+                "C-RADIO spatial features must have shape [B, N, C] or "
+                f"[B, C, H, W], got {tuple(features.shape)}"
+            )
+        return features
+
+    def forward(self, x: torch.Tensor, patch_num: int = None) -> List[torch.Tensor]:
+        """
+        : param x: (batch_size, num_patch, n_pixels)
+        """
+        images = self._unpatchify(x)
+        features = self._spatial_features(self.radio(images))
+        expected_shape = (x.shape[0], x.shape[1], self.config.image_emb_dim)
+        if tuple(features.shape) != expected_shape:
+            raise ValueError(
+                f"C-RADIO spatial features must match Molmo patch order and size: "
+                f"expected {expected_shape}, got {tuple(features.shape)}"
+            )
+        return [features]
+
+    def reset_parameters(self):
+        # Radio weights always come from the official snapshot via
+        # `reset_with_pretrained_weights`; there is nothing to random-init here.
+        pass
+
+    def reset_with_pretrained_weights(self):
+        if not self.config.init_path:
+            self.reset_parameters()
+            return
+        t0 = time.perf_counter()
+        log.info(f"Loading C-RADIO parameters from {self.config.init_path}")
+        is_sharded = hasattr(self.radio, "unshard")
+        if not is_sharded or get_global_rank() == 0:
+            state_dict = _load_hf_safetensors(self.config.init_path)
+        else:
+            state_dict = {}
+        state_dict = {f"radio.{k}": v for k, v in state_dict.items()}
+        if is_sharded:
+            key_errors = dist_cp_sd.set_model_state_dict(
+                model=self,
+                model_state_dict=state_dict,
+                options=dist_cp_sd.StateDictOptions(
+                    full_state_dict=True, broadcast_from_rank0=True, strict=False),
+            )
+        else:
+            key_errors = self.load_state_dict(state_dict, strict=False)
+        assert len(key_errors.missing_keys) == 0, key_errors.missing_keys
+        for key in key_errors.unexpected_keys:
+            assert key.startswith("radio."), key
+        log.info(f"Done in {time.perf_counter()-t0:0.1f} seconds")
+
+    def apply_fsdp2(self, *args, **kwargs):
+        # Stage 1 shards C-RADIO as a single unit; per-block sharding would need
+        # the official model's internal block list and is left for later.
+        fully_shard(self.radio, *args, **kwargs)
+        fully_shard(self, *args, **kwargs)
+
+    def apply_activation_checkpointing(self):
+        if not self.config.activation_checkpointing:
+            return
+        # The official wrapper may keep the timm tower directly under `blocks`
+        # or nested under `.model.blocks`.
+        for parent in (self.radio, getattr(self.radio, "model", None)):
+            blocks = getattr(parent, "blocks", None)
+            if blocks is not None:
+                fn = vit_activation_checkpoint_function(self.config)
+                # C-RADIO calls blocks(x), so the wrapped blocks must remain callable.
+                parent.blocks = nn.Sequential(
+                    *(checkpoint_wrapper(b, checkpoint_fn=fn) for b in blocks))
+                return
+        log.warning(
+            "C-RADIO activation checkpointing skipped: no `blocks` module list "
+            "found on the HF model"
+        )

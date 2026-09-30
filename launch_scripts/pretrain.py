@@ -39,6 +39,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(prog="Train a captioner")
     parser.add_argument("llm", choices=["debug"] + list(LLMS.keys()))
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional YAML overlay merged over the generated TrainConfig",
+    )
     parser.add_argument("--model", default="molmo2", choices=["debug", "molmo", "molmo2", "molmo_point"])
     parser.add_argument("--vision_backbone", choices=list(VISION_BACKBONES.keys()), default="siglip2")
     parser.add_argument("--global_batch_size", default=128, type=int)
@@ -47,13 +53,18 @@ if __name__ == "__main__":
                         help="Batch size for evaluation per device")
     parser.add_argument("--seq_len", default=2536, type=int,
                         help="Maximum sequence length to pad examples to.")
-    parser.add_argument("--vit_layers", type=int, nargs="+", default=[-3, -9])
+    parser.add_argument("--vit_layers", type=int, nargs="+", default=None)
     parser.add_argument("--warmup_factor", type=int, default=1)
     parser.add_argument("--nlp", default=0.1, type=float,
                         help="Fraction of NLP data in the mixture")
     parser.add_argument("--pointing", default=0.3, type=float,
                         help="Fraction of pointing data in the mixture")
     args, other_args = parser.parse_known_args()
+    radio = args.vision_backbone == "radio"
+    if radio and args.model != "molmo2":
+        parser.error("--vision_backbone radio is currently supported only with --model molmo2")
+    if radio and args.vit_layers not in (None, [0]):
+        parser.error("C-RADIO exposes one feature output; use --vit_layers 0")
 
     # Setup the model config
     seq_len = args.seq_len
@@ -71,11 +82,11 @@ if __name__ == "__main__":
         eval_examples = args.n_eval_examples
         log_interval = 20
         global_batch_size = args.global_batch_size
-        n = len(PixMoCap("train", "captions"))
-        duration = 4 * (n + global_batch_size - 1) // global_batch_size
+        # n = len(PixMoCap("train", "captions"))
+        # duration = 4 * (n + global_batch_size - 1) // global_batch_size
         eval_interval = 1000
         # vit_layers = [-2, -9] if args.vision_backbone == "openai" else [-3, -9]
-        vit_layers = args.vit_layers
+        vit_layers = args.vit_layers if args.vit_layers is not None else ([0] if radio else [-3, -9])
 
         image_vit = VISION_BACKBONES[args.vision_backbone]
         if args.model == "molmo":
@@ -118,7 +129,7 @@ if __name__ == "__main__":
                     vit=VISION_BACKBONES[args.vision_backbone],
                     vit_layers=vit_layers,
                     image_padding_embed=ImagePaddingEmbed.pad_and_partial_pad if args.vision_backbone == "openai" else None,
-                    pooling_attention_mask=True
+                    pooling_attention_mask=True,
                 ),
                 data_formatter=DataFormatter(
                     system_prompt='style_and_length_v2',
@@ -139,7 +150,7 @@ if __name__ == "__main__":
                     )
                 )
             )
-        if args.model == "molmo_point":
+        elif args.model == "molmo_point":
             # MolmoPoint was pre-trained with fewer steps but up to 16 images per a sequence
             # to improve packing
             duration = 23000
@@ -343,11 +354,10 @@ if __name__ == "__main__":
         ]
     )
 
-    # Update the trainer config w/CLI args and then run
+    # Merge order: generated defaults -> YAML overlay -> CLI dotlist overrides.
     conf = OmegaConf.create(cfg)
+    if args.config is not None:
+        conf = OmegaConf.merge(conf, OmegaConf.load(args.config))
     conf.merge_with_dotlist([clean_opt(arg) for arg in other_args])
     cfg = cast(TrainConfig, OmegaConf.to_object(conf))
     run_trainer(cfg)
-
-
-

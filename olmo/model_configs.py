@@ -124,6 +124,25 @@ SIGLIP2_VISION_BACKBONE = replace(
 )
 
 
+RADIO_VISION_BACKBONE = VitConfig(
+    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_models/vision/c-radio-v4-so400m-hf",
+    image_model_type="radio",
+    image_default_input_size=(512, 512),
+    image_patch_size=16,
+    image_pos_patch_size=16,
+    image_emb_dim=1152,
+    image_num_heads=16,
+    image_num_key_value_heads=16,
+    image_num_layers=27,
+    image_head_dim=72,
+    image_mlp_dim=4304,
+    image_mlp_activations="gelu",
+    image_num_pos=1024,
+    image_norm_eps=1e-6,
+    normalize="none",
+)
+
+
 DINOV2_LARGE_336_VISION_BACKBONE = VitConfig(
     init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_image_encoders/dinov2-large-336.pt",
     image_model_type="dino",
@@ -277,7 +296,7 @@ QWEN3_4B = LlmConfig(
 
 
 QWEN3_4B_INSTRUCT = LlmConfig(
-    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_llms/qwen3-4b-instruct.pt",
+    init_path="${oc.env:MOLMO_DATA_DIR}/pretrained_models/llm/qwen3-4b-instruct.pt",
     vocab_size=151936,
     max_sequence_length=4096,
     residual_dropout=0,
@@ -351,6 +370,7 @@ VISION_BACKBONES: Dict[str, VitConfig] = {
     "openai": OPENAICLIP_VISION_BACKBONE,
     "siglip": SIGLIP_VISION_BACKBONE,
     "siglip2": SIGLIP2_VISION_BACKBONE,
+    "radio": RADIO_VISION_BACKBONE,
     "dinov2_large_336": DINOV2_LARGE_336_VISION_BACKBONE,
     "metaclip_l14_336": METACLIP_L14_336_VISION_BACKBONE,
     "metaclip_b16_224": METACLIP_B16_224_VISION_BACKBONE,

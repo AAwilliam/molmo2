@@ -233,6 +233,10 @@ def siglip_resize_and_pad(
     else:
         is_video = True
         image = torch.permute(torch.from_numpy(image), [0, 3, 1, 2])
+    # Floating-point images are already normalized to [0, 1]. Only uint8
+    # images need the final division by 255 after resizing.
+    if torch.is_floating_point(image):
+        in_max = 1.0
     dtype = image.dtype
     if torch.is_floating_point(image):
         resized = torchvision.transforms.Resize(
@@ -348,6 +352,8 @@ class ImagePreprocessor:
         elif self.normalize == "dino":
             return (image * np.array((0.229, 0.224, 0.225), dtype=np.float32)[None, None, :] +
                     np.array((0.485, 0.456, 0.406), dtype=np.float32)[None, None, :])
+        elif self.normalize == "none":
+            return image
         else:
             raise NotImplementedError()
 
@@ -356,6 +362,10 @@ class ImagePreprocessor:
             if image.dtype == torch.uint8:
                 image = image.float() / 255.0
             return image * 2 - 1
+        elif self.normalize == "none":
+            if image.dtype == torch.uint8:
+                image = image.float() / 255.0
+            return image
         return image
 
     def normalize_image(self, image: np.ndarray):
@@ -369,6 +379,8 @@ class ImagePreprocessor:
         elif self.normalize == "dino":
             image -= np.array([0.485, 0.456, 0.406], dtype=np.float32)[None, None, :]
             image /= np.array([0.229, 0.224, 0.225], dtype=np.float32)[None, None, :]
+        elif self.normalize == "none":
+            pass
         else:
             raise NotImplementedError(self.normalize)
         return image

@@ -17,7 +17,8 @@ from olmo.preprocessing.detect_counting_question import is_pixmo_point_and_count
 from olmo.util import flatten_lists, resource_path
 
 if DATA_HOME is not None:
-    PIXMO_DATASETS = join(DATA_HOME, "pixmo_datasets")
+    # pixmo local datasets live under dataset/stage1/pixmo_datasets (symlinked to the data volume)
+    PIXMO_DATASETS = join(os.path.dirname(DATA_HOME), "dataset", "stage1", "pixmo_datasets")
 else:
     PIXMO_DATASETS = None
 """Where to save local version of the data after URLs filtering"""
@@ -135,9 +136,17 @@ class PixMoPoints(Dataset):
             for url in eval_ds["image_url"]:
                 if url in filenames:
                     del filenames[url]
+        sha_by_url = {}
+        for u, s in zip(ds["image_url"], ds["image_sha256"]):
+            sha_by_url.setdefault(u, set()).add(s)
+        bad_urls = {u for u, ss in sha_by_url.items() if len(ss) > 1}
+        if bad_urls:
+            logging.info(f"Dropping {len(bad_urls)} urls with inconsistent image_sha256 annotations")
         for method, local_name in zip(collection_method, local_names):
             logging.info(f"Building subset {method}")
             ds_for_method = ds.filter(lambda x: x == method, input_columns="collection_method")
+            if bad_urls:
+                ds_for_method = ds_for_method.filter(lambda x: x not in bad_urls, input_columns="image_url")
             filtered_dataset = filter_and_group_data(ds_for_method, filenames, check_sha)
             name = "high_frequency" if method == "counting" else "basic"
             save_local_dataset(filtered_dataset, local_name, n_procs=n_procs, n_val=n_val)

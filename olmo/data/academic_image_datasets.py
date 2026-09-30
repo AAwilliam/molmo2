@@ -760,7 +760,7 @@ class PixmoMulitDocQa(Dataset):
 
 
 class CoSynPoint(HfDataset):
-    PATH = "allenai/CoSyn-point"
+    PATH = str(Path(__file__).resolve().parents[2] / "dataset" / "stage1" / "CoSyn-point")
 
     def get(self, item, rng):
         example = self.dataset[item]

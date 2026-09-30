@@ -6,13 +6,15 @@ import logging
 import multiprocessing
 import os
 import pickle
+import sys
 import time
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from os import rename, makedirs
 from os.path import join, exists, relpath
 from typing import Union, Dict, Optional
+from urllib.parse import urlparse
 
 import PIL.Image
 import datasets
@@ -61,8 +63,24 @@ client = None
 
 def init_worker():
     global client
-    client = httpx.Client(timeout=httpx.Timeout(60, connect=5))
+    client = httpx.Client(timeout=httpx.Timeout(20, connect=5), follow_redirects=True)
     setup_pil()
+
+
+def _validate_image(image_bytes, image_sha, check_sha):
+    if check_sha:
+        if compute_hash(image_bytes) != image_sha:
+            return ValueError("Mismatched image hash")
+    else:
+        try:
+            with warnings.catch_warnings(record=True):
+                img = PIL.Image.open(io.BytesIO(image_bytes))
+                if min(img.size) == 0:
+                    raise ValueError("Zero dimensional image")
+                img.verify()
+        except Exception as exc:
+            return exc
+    return None
 
 
 def _download_images(args):
@@ -75,59 +93,44 @@ def _download_images(args):
     cache_file = join(src_dir, image_id)
 
     if exists(cache_file):
-        with open(cache_file, "rb") as f:
-            image_bytes = f.read()
-    elif cache_only:
-        return DownloadError(url, ValueError('Not in cache'))
-    else:
-        max_attempts = 3
         try:
-            for attempt in range(max_attempts):
-                if attempt > 0:
-                    time.sleep(2 ** attempt)
-                try:
-                    response = client.get(url)
-                except httpx.TransportError:
-                    # Retry connection errors
-                    if attempt == max_attempts-1:
-                        raise
-                    else:
-                        continue
-                if response.status_code == 429 and attempt < max_attempts-1:
-                    # Too many requests error, try and back off
-                    continue
-                response.raise_for_status()
-                image_bytes = response.content
-                break
-        except Exception as e:
-            with open(cache_file, 'w') as f:
-                f.write(str(e))
-            # httpx errors sometimes cannot be sent between processes, so just send the string
-            return DownloadError(url, str(e))
-        # Else write the file bytes even though we have not confirmed the result is an image
-        # Write to a tmp file and rename to ensure we don't only partially write an image if
-        # we crash mid-write
-        with open(cache_file + ".tmp", 'wb') as f:
-            f.write(image_bytes)
-        rename(cache_file + ".tmp", cache_file)
+            with open(cache_file, "rb") as stream:
+                cached_bytes = stream.read()
+            if _validate_image(cached_bytes, image_sha, check_sha) is None:
+                return url, cache_file
+        except OSError:
+            pass
+        # An old attempt may have cached an exception string instead of an image.
+        # Keep that file until a valid replacement is ready, then atomically replace it.
+    if cache_only:
+        return DownloadError(url, "Missing or invalid cached image")
 
-    if check_sha:
-        downloaded_hash = compute_hash(image_bytes)
-        assert image_sha is not None
-        if downloaded_hash != image_sha:
-            return ImageError(url, ValueError("Mismatched image hash"))
-    else:
-        # Else make sure we actually got an image, and it can be parsed by PIL
+    for attempt in range(3):
         try:
-            # Avoid annoying palette transparency warnings filling up the logs
-            with warnings.catch_warnings(record=True) as w:
-                img = PIL.Image.open(io.BytesIO(image_bytes))
-                if min(img.size) == 0:
-                    raise ValueError("Zero dimensional image")
-        except Exception as e:
-            return ImageError(url, e)
-
-    return url, cache_file
+            response = client.get(url)
+            response.raise_for_status()
+            image_bytes = response.content
+            validation_error = _validate_image(image_bytes, image_sha, check_sha)
+            if validation_error is not None:
+                return ImageError(url, str(validation_error))
+            temp_file = f"{cache_file}.{os.getpid()}.tmp"
+            with open(temp_file, "wb") as stream:
+                stream.write(image_bytes)
+            os.replace(temp_file, cache_file)
+            return url, cache_file
+        except httpx.HTTPStatusError as exc:
+            reason = f"HTTP {exc.response.status_code}"
+            if exc.response.status_code in (400, 401, 403, 404, 410, 451):
+                return DownloadError(url, reason)
+        except httpx.TooManyRedirects as exc:
+            return DownloadError(url, f"TooManyRedirects: {exc}")
+        except (httpx.RequestError, OSError, ValueError) as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            if isinstance(exc, httpx.ConnectError) and "Network is unreachable" in str(exc):
+                return DownloadError(url, reason)
+        if attempt < 2:
+            time.sleep(2 ** attempt)
+    return DownloadError(url, reason)
 
 
 def download_pixmo_urls(
@@ -164,8 +167,14 @@ def download_pixmo_urls(
 
     images = []
     to_save = [(url, image_sha, check_sha, cache_only, output_dir, request_kwargs) for url, image_sha in urls_and_shas]
-    pbar = tqdm(total=len(to_save), desc=f"{0}/{len(to_save)}")
+    pbar = tqdm(total=len(to_save), desc=f"{0}/{len(to_save)}", disable=not sys.stderr.isatty())
     image_error, download_err, success = 0, 0, 0
+    errors_by_reason = Counter()
+    errors_by_host = Counter()
+    failure_manifest = os.environ.get("PIXMO_FAILURE_MANIFEST")
+    failure_stream = open(failure_manifest, "w", encoding="utf-8") if failure_manifest else None
+    if failure_stream:
+        failure_stream.write("url\ttype\terror\n")
 
     if n_processes != 1:
         def _iter():
@@ -179,20 +188,35 @@ def download_pixmo_urls(
                 yield _download_images(val)
 
     found_urls = {}
-    for val in _iter():
-        if isinstance(val, ImageError):
-            image_error += 1
-        elif isinstance(val, DownloadError):
-            download_err += 1
-        else:
-            url, filename = val
-            found_urls[url] = filename
-            success += 1
-        pbar.update(1)
-        pbar.set_description(
-            f"dl_er={download_err} file_err={image_error}",
-            refresh=False)
-    pbar.close()
+    try:
+        for index, val in enumerate(_iter(), 1):
+            if isinstance(val, (ImageError, DownloadError)):
+                if isinstance(val, ImageError):
+                    image_error += 1
+                else:
+                    download_err += 1
+                reason = str(val.exception).replace("\t", " ").replace("\n", " ")
+                errors_by_reason[reason.split(":", 1)[0]] += 1
+                errors_by_host[urlparse(val.url).hostname] += 1
+                if failure_stream:
+                    failure_stream.write(f"{val.url}\t{type(val).__name__}\t{reason}\n")
+            else:
+                url, filename = val
+                found_urls[url] = filename
+                success += 1
+            pbar.update(1)
+            if index % 5000 == 0:
+                logging.info(
+                    "PixMo URLs %d/%d: success=%d download_errors=%d image_errors=%d; top reasons=%s; top hosts=%s",
+                    index, len(to_save), success, download_err, image_error,
+                    errors_by_reason.most_common(5), errors_by_host.most_common(5),
+                )
+                if failure_stream:
+                    failure_stream.flush()
+    finally:
+        pbar.close()
+        if failure_stream:
+            failure_stream.close()
     logging.info(f"Got images for {len(found_urls)}/{len(urls_and_shas)} ({len(found_urls)/len(urls_and_shas)*100:0.2f}%) image URLs")
     return found_urls
 

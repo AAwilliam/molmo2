@@ -33,6 +33,7 @@ class MultiCropConfig(BaseConfig):
     multi_image_pooling_h: int = 2
     use_single_crop_col_tokens: Optional[bool] = None
     use_single_crop_start_token: bool = False
+    single_crop_for_small_images: bool = False
 
     def build_image_preprocessor(self, tokenizer, image_preprocessor, image_padding_mask=False,
                                  legacy_image_mask=False, use_low_res_token_global_crops=False):
@@ -52,6 +53,7 @@ class MultiCropConfig(BaseConfig):
             use_low_res_token_global_crops=use_low_res_token_global_crops,
             use_single_crop_col_tokens=self.use_single_crop_col_tokens,
             use_single_crop_start_token=self.use_single_crop_start_token,
+            single_crop_for_small_images=self.single_crop_for_small_images,
         )
         if self.max_images is not None:
             multi_image = MultiImagePreprocessor(
@@ -90,6 +92,7 @@ class MultiCropImagePreprocessor:
     use_low_res_token_global_crops: bool = False
     use_single_crop_col_tokens: Optional[bool] = None
     use_single_crop_start_token: bool = False
+    single_crop_for_small_images: bool = False
 
 
     def get_output_shapes(self) -> Dict[str, TensorSpec]:
@@ -185,6 +188,28 @@ class MultiCropImagePreprocessor:
                 joint,
                 [self.tokenizer.image_end_token_id]
             ]
+
+            # A single crop already covers a small image. Keep its patch indices
+            # unchanged so grounding still maps to the one image sent to the ViT.
+            if (
+                self.crop_mode == "overlap-and-resize-c2"
+                and self.single_crop_for_small_images
+                and original_image_h <= crop_size
+                and original_image_w <= crop_size
+                and crop_arr.shape[0] == 1
+            ):
+                images = batch_pixels_to_patches(crop_arr, image_patch_size)
+                if mask_arr is not None:
+                    mask_arr = batch_pixels_to_patches(mask_arr, image_patch_size).astype(np.float32).mean(axis=-1)
+                return TokenizedVisionData(
+                    tokens=np.concatenate(joint, 0),
+                    images=images,
+                    image_masks=mask_arr,
+                    token_pooling=pooling_idx,
+                    token_mapping=patch_idx_arr,
+                    cum_token_pooling_bounds=np.array([pooling_idx.shape[0]], dtype=np.int64),
+                    cum_image_bounds=np.array([images.shape[0]], dtype=np.int64),
+                )
 
             if self.crop_mode == "overlap-and-resize":
                 crop_arr = batch_pixels_to_patches(crop_arr, image_patch_size)
@@ -290,4 +315,3 @@ class MultiImagePreprocessor:
             if self.max_images is not None and idx == self.max_images - 1:
                 break
         return tokenized_images
-

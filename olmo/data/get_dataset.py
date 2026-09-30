@@ -34,6 +34,7 @@ from olmo.data.molmo2_video_track_datasets import Molmo2VideoTrackInstruction, M
 from olmo.data.molmo_hardcode import Molmo2HardCodes
 from olmo.data.pixmo_datasets import PixMoMultiPoints, PixMoCapQa, PixMoCount, PixMoCap, \
     PixMoAskModelAnything, PixMoPoints, PixmoMultiImageQa, PixMoPointsEval
+from olmo.data.caption_datasets import Docci, TextCaps, Dci
 from olmo.data.text_datasets import Tulu4Filtered
 
 
@@ -148,6 +149,12 @@ def get_dataset_by_name(dataset_name, split) -> Dataset:
     ]
     cosyn_dataset_names = [f"cosyn_{doc_type}{suffix}" for doc_type, suffix in
                            itertools.product(doc_types, ["", "_exp"])]
+    if dataset_name == "docci":
+        return Docci(split=split)
+    if dataset_name == "textcaps":
+        return TextCaps(split=split)
+    if dataset_name == "dci":
+        return Dci(split=split)
     if dataset_name == "cosyn_point":
         return CoSynPoint(split=split)
     elif dataset_name in cosyn_dataset_names:

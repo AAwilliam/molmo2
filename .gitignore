@@ -56,3 +56,11 @@ site/
 checkpoints/
 uv.lock
 notebooks
+
+# Local training assets and runtime output (never publish data or weights)
+/dataset/
+/pretrained_models/
+/output/
+/huggingface/
+/debug.log
+/ppu_hold.log

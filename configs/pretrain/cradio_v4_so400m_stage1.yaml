@@ -1,0 +1,63 @@
+model:
+  llm:
+    tokenizer:
+      identifier: ${oc.env:MOLMO_DATA_DIR}/pretrained_models/llm/qwen3-4b-instruct-2507-modelscope
+  vision_backbone:
+    vit:
+      # Match Molmo2's image and video preprocessing: resize directly, without padding.
+      resize_mode: siglip
+      # Keep C-RADIO pixels in [0, 1]; this does not select a SigLIP vision tower.
+      normalize: none
+    # C-RADIO exposes its final features; do not prune its internal layers or compile these modules.
+    skip_unused_layers: false
+    compile_vit: null
+    compile_connector: null
+  mm_preprocessor:
+    image:
+      crop_mode: overlap-and-resize-c2
+      max_crops: 8
+      overlap_margins: [4, 4]
+      single_crop_for_small_images: true
+
+# Match the original pretrain.py fine-tuning settings.
+ft_vit: true
+ft_connector: true
+ft_llm: true
+device_train_microbatch_size: 8
+
+optimizer:
+  connector_learning_rate: 2.0e-4
+  llm_learning_rate: 2.0e-5
+  vit_learning_rate: 6.0e-6
+
+# Dataset names below resolve to the project's dataset/stage1/ links.
+# Group rates must add up to 1.0.
+# Add newly completed datasets here and rebalance the rates as needed.
+data:
+  dataset: null
+  mixture: null
+  num_workers: 0
+  pin_memory: false
+  kwargs_mixture:
+    - name: caption
+      rate: 0.6
+      datasets:
+        - dataset_name: docci
+        - dataset_name: textcaps
+        - dataset_name: dci
+        - dataset_name: pixmo_cap_with_transcripts
+    - name: pointing
+      rate: 0.3
+      datasets:
+        - dataset_name: cosyn_point
+        - dataset_name: pixmo_count_train
+        - dataset_name: pixmo_points_train
+        - dataset_name: pixmo_points_high_freq_train
+    - name: nlp
+      rate: 0.1
+      datasets:
+        - dataset_name: tulu4_max_2304
+
+# The default evaluators require PixMo data that is not ready yet.
+evaluators: []
+inf_evaluators: []
